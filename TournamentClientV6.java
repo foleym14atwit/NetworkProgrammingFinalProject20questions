@@ -1,0 +1,214 @@
+package tournementGame ;
+import java.io.IOException;
+import java.net.*;
+import java.util.Scanner;
+
+public class TournamentClientV6 {
+
+    private static final int LOBBY_PORT = 9000;
+    private static final int DISCOVERY_PORT = 9001;
+
+    public static void main(String[] args) {
+        Scanner in = new Scanner(System.in);
+
+        InetAddress server;
+        try {
+            server = discoverServer();
+            System.out.println("Discovered server at " + server.getHostAddress());
+        } catch (IOException e) {
+            System.out.print("Server IP: ");
+            String ip = in.nextLine().trim();
+            if (ip.isEmpty()) ip = "127.0.0.1";
+            try {
+                server = InetAddress.getByName(ip);
+            } catch (IOException ex) {
+                System.err.println("Error resolving server IP: " + ex.getMessage());
+                return;
+            }
+        }
+
+        System.out.print("Name: ");
+        String name = in.nextLine().trim();
+        if (name.isEmpty()) name = "Player";
+
+        System.out.print("Create (C) or Join (J)? ");
+        String choice = in.nextLine().trim().toUpperCase();
+
+        try (DatagramSocket sock = new DatagramSocket()) {
+            int tid;
+
+            if (choice.equals("C")) {
+                send(sock, "CREATE_TOURNAMENT " + name, server, LOBBY_PORT);
+                String reply = recv(sock);
+                if (!reply.startsWith("TOURNAMENT")) {
+                    System.out.println("Server: " + reply);
+                    return;
+                }
+                tid = Integer.parseInt(reply.split("\\s+")[1]);
+                System.out.println("Tournament ID: " + tid);
+                System.out.println("Type START to begin.");
+
+                while (true) {
+                    String cmd = in.nextLine().trim().toUpperCase();
+                    if (cmd.equals("START")) {
+                        send(sock, "START_TOURNAMENT " + tid, server, LOBBY_PORT);
+                        break;
+                    }
+                }
+            } else {
+                System.out.print("Tournament ID: ");
+                tid = Integer.parseInt(in.nextLine().trim());
+                send(sock, "JOIN_TOURNAMENT " + name + " " + tid, server, LOBBY_PORT);
+                String reply = recv(sock);
+                if (!reply.startsWith("JOINED")) {
+                    System.out.println("Server: " + reply);
+                    return;
+                }
+                System.out.println("Joined tournament " + tid + ", waiting...");
+            }
+
+            boolean playing = true;
+            while (playing) {
+                String msg = recv(sock);
+
+                if (msg.startsWith("MATCH ")) {
+                    String[] parts = msg.split("\\s+");
+                    int matchPort = Integer.parseInt(parts[1]);
+                    String opp = parts[2];
+                    System.out.println("Match vs " + opp + " (port " + matchPort + ")");
+                    playMatch(sock, server, matchPort, in);
+
+                } else if (msg.startsWith("BYE")) {
+                    System.out.println("Bye this round.");
+
+                } else if (msg.startsWith("CHAMPION")) {
+                    String who = msg.split("\\s+")[1];
+                    if (who.equals("YOU")) System.out.println("You are the champion!");
+                    else System.out.println("Champion: " + who);
+                    playing = false;
+
+                } else {
+                    System.out.println("Server: " + msg);
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+        }
+    }
+
+    private static InetAddress discoverServer() throws IOException {
+        try (DatagramSocket ds = new DatagramSocket()) {
+            ds.setBroadcast(true);
+            byte[] data = "DISCOVER_TOURNAMENT_SERVER".getBytes();
+            DatagramPacket p = new DatagramPacket(
+                    data,
+                    data.length,
+                    InetAddress.getByName("255.255.255.255"),
+                    DISCOVERY_PORT
+            );
+            ds.send(p);
+            ds.setSoTimeout(3000);
+            byte[] buf = new byte[1024];
+            DatagramPacket resp = new DatagramPacket(buf, buf.length);
+            ds.receive(resp);
+            String msg = new String(resp.getData(), 0, resp.getLength()).trim();
+            if (!"SERVER_HERE".equals(msg)) {
+                throw new IOException("Unexpected discovery response: " + msg);
+            }
+            return resp.getAddress();
+        }
+    }
+
+    private static void playMatch(DatagramSocket sock, InetAddress server, int matchPort, Scanner in) throws IOException {
+        boolean inMatch = true;
+
+        while (inMatch) {
+            String msg = recv(sock);
+
+            if (msg.startsWith("ROUND ")) {
+                String[] parts = msg.split("\\s+");
+                String role = parts[2];
+                System.out.println("Role: " + role);
+
+            } else if (msg.equals("SEND_SECRET")) {
+                System.out.print("Category: ");
+                String cat = in.nextLine().trim();
+                System.out.print("Secret: ");
+                String secret = in.nextLine().trim();
+                send(sock, "SECRET " + cat + " " + secret, server, matchPort);
+
+            } else if (msg.startsWith("QUESTION ")) {
+                String q = msg.substring("QUESTION ".length());
+                System.out.println("Question from guesser: " + q);
+                System.out.print("Answer (yes/no): ");
+                String ans = in.nextLine().trim().toLowerCase();
+                if (ans.startsWith("y")) ans = "YES";
+                else ans = "NO";
+                send(sock, "ANSWER " + ans, server, matchPort);
+
+            } else if (msg.startsWith("CATEGORY ")) {
+                String cat = msg.substring("CATEGORY ".length());
+                System.out.println("Guessing. Category: " + cat);
+                int guessNum = 0;
+
+                while (true) {
+                    System.out.print("Guess #" + (guessNum + 1) + " (or ?question): ");
+                    String g = in.nextLine().trim();
+
+                    if (g.startsWith("?")) {
+                        String q = g.substring(1).trim();
+                        if (q.isEmpty()) {
+                            System.out.println("Empty question, try again.");
+                            continue;
+                        }
+                        send(sock, "QUESTION " + q, server, matchPort);
+                        String fb = recv(sock);
+
+                        if (fb.startsWith("ANSWER ")) {
+                            System.out.println("Protector: " + fb.substring("ANSWER ".length()));
+                        } else {
+                            System.out.println("Server: " + fb);
+                        }
+                        continue;
+                    }
+
+                    guessNum++;
+                    send(sock, "GUESS " + g, server, matchPort);
+                    String fb = recv(sock);
+                    if (fb.equals("FEEDBACK CORRECT")) {
+                        System.out.println("Correct!");
+                        break;
+                    } else if (fb.equals("FEEDBACK QUIT")) {
+                        System.out.println("You quit.");
+                        break;
+                    } else if (fb.equals("FEEDBACK WRONG")) {
+                        System.out.println("Wrong.");
+                    } else {
+                        System.out.println("Server: " + fb);
+                    }
+                }
+
+            } else if (msg.startsWith("MATCH_OVER")) {
+                System.out.println(msg);
+                inMatch = false;
+
+            } else {
+                System.out.println("Server: " + msg);
+            }
+        }
+    }
+
+    private static void send(DatagramSocket sock, String msg, InetAddress addr, int port) throws IOException {
+        byte[] data = msg.getBytes();
+        DatagramPacket pkt = new DatagramPacket(data, data.length, addr, port);
+        sock.send(pkt);
+    }
+
+    private static String recv(DatagramSocket sock) throws IOException {
+        byte[] buf = new byte[1024];
+        DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+        sock.receive(pkt);
+        return new String(pkt.getData(), 0, pkt.getLength()).trim();
+    }
+}
