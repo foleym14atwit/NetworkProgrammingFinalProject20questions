@@ -1,0 +1,213 @@
+package tournementGame;
+import java.io.IOException;
+import java.net.*;
+import java.util.*;
+
+public class TournamentServerV6 {
+
+    private static final int LOBBY_PORT = 9000;
+    private static final Map<Integer, Tournament> tournaments = new HashMap<>();
+    private static final Random random = new Random();
+
+    private static class Player {
+        InetAddress addr;
+        int port;
+        String name;
+        Player(InetAddress a, int p, String n) { addr = a; port = p; name = n; }
+    }
+
+    private static class Tournament {
+        int id;
+        List<Player> players = new ArrayList<>();
+        Tournament(int id) { this.id = id; }
+    }
+
+    public static void main(String[] args) {
+
+        try (DatagramSocket lobby = new DatagramSocket(LOBBY_PORT)) {
+            byte[] buf = new byte[1024];
+
+            while (true) {
+                DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+                lobby.receive(pkt);
+                String msg = new String(pkt.getData(), 0, pkt.getLength()).trim();
+                String[] parts = msg.split("\\s+");
+                if (parts.length == 0) continue;
+
+                String cmd = parts[0];
+
+                if (cmd.equals("CREATE_TOURNAMENT")) {
+                    String name = parts.length > 1 ? parts[1] : "Player";
+                    int id = genId();
+                    Tournament t = new Tournament(id);
+                    t.players.add(new Player(pkt.getAddress(), pkt.getPort(), name));
+                    tournaments.put(id, t);
+                    send(lobby, "TOURNAMENT " + id, pkt.getAddress(), pkt.getPort());
+
+                } else if (cmd.equals("JOIN_TOURNAMENT")) {
+                    if (parts.length < 3) {
+                        send(lobby, "ERR", pkt.getAddress(), pkt.getPort());
+                        continue;
+                    }
+                    String name = parts[1];
+                    int id;
+                    try { id = Integer.parseInt(parts[2]); }
+                    catch (NumberFormatException e) { send(lobby, "ERR", pkt.getAddress(), pkt.getPort()); continue; }
+                    Tournament t = tournaments.get(id);
+                    if (t == null) { send(lobby, "ERR", pkt.getAddress(), pkt.getPort()); continue; }
+                    t.players.add(new Player(pkt.getAddress(), pkt.getPort(), name));
+                    send(lobby, "JOINED " + id + " " + t.players.size(), pkt.getAddress(), pkt.getPort());
+
+                } else if (cmd.equals("START_TOURNAMENT")) {
+                    if (parts.length < 2) {
+                        send(lobby, "ERR", pkt.getAddress(), pkt.getPort());
+                        continue;
+                    }
+                    int id;
+                    try { id = Integer.parseInt(parts[1]); }
+                    catch (NumberFormatException e) { send(lobby, "ERR", pkt.getAddress(), pkt.getPort()); continue; }
+                    Tournament t = tournaments.get(id);
+                    if (t == null || t.players.size() < 2) {
+                        send(lobby, "ERR", pkt.getAddress(), pkt.getPort());
+                        continue;
+                    }
+                    runTournament(lobby, t);
+
+                } else {
+                    send(lobby, "ERR", pkt.getAddress(), pkt.getPort());
+                }
+            }
+
+        } catch (IOException e) {
+            System.err.println("Server error: " + e.getMessage());
+        }
+    }
+
+
+    private static int genId() {
+        int id;
+        do {
+            id = 1000 + random.nextInt(9000);
+        } while (tournaments.containsKey(id));
+        return id;
+    }
+
+    private static void send(DatagramSocket sock, String msg, InetAddress addr, int port) throws IOException {
+        byte[] data = msg.getBytes();
+        sock.send(new DatagramPacket(data, data.length, addr, port));
+    }
+
+    private static void runTournament(DatagramSocket lobby, Tournament t) throws IOException {
+        List<Player> current = new ArrayList<>(t.players);
+
+        while (current.size() > 1) {
+            List<Player> next = new ArrayList<>();
+
+            for (int i = 0; i < current.size(); i += 2) {
+                if (i + 1 >= current.size()) {
+                    Player bye = current.get(i);
+                    next.add(bye);
+                    send(lobby, "BYE", bye.addr, bye.port);
+                } else {
+                    Player p1 = current.get(i);
+                    Player p2 = current.get(i + 1);
+                    int matchPort = 10000 + random.nextInt(50000);
+                    send(lobby, "MATCH " + matchPort + " " + p2.name, p1.addr, p1.port);
+                    send(lobby, "MATCH " + matchPort + " " + p1.name, p2.addr, p2.port);
+                    Player winner = playMatch(matchPort, p1, p2);
+                    next.add(winner);
+                }
+            }
+            current = next;
+        }
+
+        Player champ = current.get(0);
+        for (Player p : t.players) {
+            String m = (p.addr.equals(champ.addr) && p.port == champ.port)
+                    ? "CHAMPION YOU"
+                    : "CHAMPION " + champ.name;
+            send(lobby, m, p.addr, p.port);
+        }
+    }
+
+    private static Player playMatch(int port, Player p1, Player p2) throws IOException {
+        try (DatagramSocket matchSock = new DatagramSocket(port)) {
+            matchSock.setSoTimeout(60000); // 60 second timeout
+            
+            int g2 = playRound(matchSock, p1, p2, 1);
+            int g1 = playRound(matchSock, p2, p1, 2);
+
+            Player winner = (g1 < g2) ? p1 : (g2 < g1 ? p2 : p1);
+
+            String m1 = (winner == p1 ? "MATCH OVER WIN " : "MATCH OVER LOSE ") + g1;
+            String m2 = (winner == p2 ? "MATCH OVER WIN " : "MATCH OVER LOSE ") + g2;
+
+            send(matchSock, m1, p1);
+            send(matchSock, m2, p2);
+
+            return winner;
+        }
+    }
+
+    private static int playRound(DatagramSocket sock, Player protector, Player guesser, int round) throws IOException {
+        // Add small delays to ensure message ordering
+        send(sock, "ROUND " + round + " PROTECTOR", protector);
+        Thread.yield();
+        send(sock, "ROUND " + round + " GUESSER", guesser);
+        Thread.yield();
+
+        send(sock, "SEND_SECRET", protector);
+        String sLine = recvFrom(sock, protector);
+        String[] parts = sLine.split("\\s+", 3);
+        if (parts.length < 3) return Integer.MAX_VALUE;
+
+        String category = parts[1];
+        String secret = parts[2].toLowerCase();
+        
+        // Small delay before sending category
+        try { Thread.sleep(50); } catch (InterruptedException e) {}
+        send(sock, "CATEGORY " + category, guesser);
+
+        int guesses = 0;
+        while (true) {
+            String line = recvFrom(sock, guesser);
+
+            if (line.startsWith("QUESTION ")) {
+                send(sock, line, protector);
+                String ans = recvFrom(sock, protector);
+                send(sock, ans, guesser);
+                continue;
+            }
+
+            if (!line.startsWith("GUESS ")) continue;
+            String g = line.substring(6).trim().toLowerCase();
+            if (g.equals("quit")) {
+                send(sock, "FEEDBACK QUIT", guesser);
+                return Integer.MAX_VALUE;
+            }
+            guesses++;
+            if (g.equals(secret)) {
+                send(sock, "FEEDBACK CORRECT", guesser);
+                return guesses;
+            } else {
+                send(sock, "FEEDBACK WRONG", guesser);
+            }
+        }
+    }
+
+    private static void send(DatagramSocket sock, String msg, Player p) throws IOException {
+        byte[] data = msg.getBytes();
+        sock.send(new DatagramPacket(data, data.length, p.addr, p.port));
+    }
+
+    private static String recvFrom(DatagramSocket sock, Player p) throws IOException {
+        byte[] buf = new byte[1024];
+        while (true) {
+            DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+            sock.receive(pkt);
+            if (pkt.getAddress().equals(p.addr) && pkt.getPort() == p.port) {
+                return new String(pkt.getData(), 0, pkt.getLength()).trim();
+            }
+        }
+    }
+}
